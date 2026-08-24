@@ -1,0 +1,22 @@
+{
+  "name": "hitori-pi-extensions",
+  "version": "1.0.0",
+  "description": "Personal extensions for the Pi coding agent",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "coding-agent"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0"
+  }
+}

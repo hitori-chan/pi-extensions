@@ -1,0 +1,4 @@
+# Session files, logs and test artifacts never belong in the repo
+*.log
+node_modules/
+.DS_Store
