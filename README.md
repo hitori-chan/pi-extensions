@@ -13,9 +13,10 @@ Updates: `git pull`, then `/reload` in pi.
 
 ## Extensions
 
-| Extension               | Purpose                                                                                                                                                                                |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [goal](extensions/goal) | `/goal <condition>`: keeps working until an independent evaluator judges the condition met (or impossible). The evaluator replays the agent's exact context, sharing its prompt cache. |
+| Extension                 | Purpose                                                                                                                                                                                                     |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [goal](extensions/goal)   | `/goal <condition>`: keeps working until an independent evaluator judges the condition met (or impossible). The evaluator replays the agent's exact context, sharing its prompt cache.                      |
+| [tasks](extensions/tasks) | Background tasks: `bash` with `run_in_background`, timeouts and Ctrl+B that move running commands to the background, `monitor` for streamed events, reports that wake the agent, `task_stop`, and `/tasks`. |
 
 ## Notes
 

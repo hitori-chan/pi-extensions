@@ -58,6 +58,12 @@ A goal is held when:
 - a model request fails after pi's own retries,
 - or the evaluator fails twice.
 
+While [background tasks](../tasks) run, evaluation waits. Each task's report
+starts a turn, and the goal is judged once none are running; the footer shows
+the wait. If the agent sits idle waiting, a check-in lists the running tasks
+and asks it to check their output. Check-ins come after 30 minutes, then 1 hour,
+then 2 hours, at most three between your prompts.
+
 ## Evaluator
 
 The evaluator receives the agent's **exact context**: system prompt, tool

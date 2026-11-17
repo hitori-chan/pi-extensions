@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, describe, it } from "node:test";
+import { beforeEach, describe, it, mock } from "node:test";
 import {
 	DEFAULT_CONFIG,
 	findSnapshots,
@@ -227,8 +227,13 @@ function harness(
 	const mid = { ...small, id: "mid", contextWindow: 32_000, maxTokens: 32_000 };
 	const models = [session, small, mid];
 
+	const channels = new Map<string, (data: unknown) => void>();
 	const pi: any = {
 		on: (name: string, h: Handler) => void handlers.set(name, [...(handlers.get(name) ?? []), h]),
+		events: {
+			on: (channel: string, h: (data: unknown) => void) => void channels.set(channel, h),
+			emit: (channel: string, data: unknown) => channels.get(channel)?.(data),
+		},
 		registerCommand: (name: string, c: any) => void commands.set(name, c),
 		registerMessageRenderer: () => {},
 		appendEntry: (customType: string, data: unknown) =>
@@ -296,14 +301,25 @@ function harness(
 		judgeCalls,
 		emit,
 		settle,
-		verdict,
-		status: () => status,
+		/** What the tasks extension broadcasts. */
+		tasksRunning: (count: number) =>
+			pi.events.emit(
+				"tasks:running",
+				Array.from({ length: count }, (_, i) => ({
+					id: `t${i}`,
+					label: "npm run dev",
+					file: `/tmp/t${i}.log`,
+					startedAt: Date.now(),
+				})),
+			),
 		/** An assistant message, as pi records it. */
 		usage: (input: number, output: number, at = Date.now()) =>
 			void branch.push({
 				type: "message",
 				message: { role: "assistant", timestamp: at, usage: { input, output, cacheRead: 0, cacheWrite: 0 } },
 			}),
+		verdict,
+		status: () => status,
 		reply: (...r: (string | (() => Promise<string>))[]) => void (replies = r),
 		goal: (args: string) => commands.get("goal")!.handler(args, ctx),
 		turn: (tools: number) => emit("turn_end", { toolResults: Array(tools).fill({}) }),
@@ -439,6 +455,65 @@ describe("goal loop", () => {
 		assert.equal(await h.settle({ outcome: "aborted" }), undefined);
 		assert.equal(await h.settle({ pending: [{}] }), undefined);
 		assert.equal(h.judgeCalls.length, 2);
+	});
+
+	it("waits for background tasks before judging", async () => {
+		await h.goal("build passes");
+		h.tasksRunning(1);
+		await h.turn(1);
+		assert.match(h.status() ?? "", /^◎ \/goal waiting · \d+s$/);
+		assert.equal(await h.settle(), undefined);
+		assert.equal(h.judgeCalls.length, 0);
+		h.tasksRunning(0); // its report starts the next turn
+		h.reply(h.verdict("met", "build passed"));
+		assert.equal((await h.settle()).entries[0].data.status, "achieved");
+	});
+
+	it("checks in after 30m, 1h, and 2h of waiting on tasks, at most three times between prompts", async () => {
+		mock.timers.enable({ apis: ["setTimeout"] });
+		try {
+			await h.goal("dev server answers");
+			h.tasksRunning(2);
+			const checkins = () => h.sent.filter((s) => s.message.details.kind === "checkin");
+			for (const [minutes, before] of [
+				[30, 0],
+				[60, 1],
+				[120, 2],
+			]) {
+				await h.settle(); // deferred: arms the next check-in
+				mock.timers.tick(minutes * 60_000 - 1);
+				assert.equal(checkins().length, before, `${minutes}m not yet`);
+				mock.timers.tick(1);
+				assert.equal(checkins().length, before + 1, `after ${minutes}m`);
+			}
+			await h.settle();
+			mock.timers.tick(10 * 60 * 60_000);
+			assert.equal(checkins().length, 3); // capped until the next prompt
+			const [first] = checkins();
+			assert.deepEqual(first.options, { triggerTurn: true });
+			assert.match(
+				first.message.content,
+				/^\[Goal check-in\] The goal is evaluated once no background tasks are running\. Still running:\n- t0 \(\d+s\): npm run dev · output: \/tmp\/t0\.log\n- t1/,
+			);
+			assert.match(first.message.content, /<goal_condition>\ndev server answers\n/);
+
+			await h.userPrompt(); // a prompt allows three more
+			await h.settle();
+			await h.emit("agent_start");
+			mock.timers.tick(30 * 60_000); // activity cancels the pending check-in
+			assert.equal(checkins().length, 3);
+			await h.settle();
+			h.tasksRunning(0); // and so does the last task ending
+			mock.timers.tick(30 * 60_000);
+			assert.equal(checkins().length, 3);
+			h.tasksRunning(1);
+			await h.settle();
+			await h.emit("session_shutdown");
+			mock.timers.tick(30 * 60_000);
+			assert.equal(checkins().length, 3);
+		} finally {
+			mock.timers.reset();
+		}
 	});
 
 	it("/goal shows the tokens spent since the goal was set", async () => {

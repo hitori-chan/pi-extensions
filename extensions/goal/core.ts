@@ -187,6 +187,26 @@ export function verdictPrompt(
 	return `[Goal not met — evaluation ${evaluation}] ${reason}\n\n${block(condition)}`;
 }
 
+/** A background task, as the tasks extension reports it on `tasks:running`. */
+export interface RunningTask {
+	id: string;
+	label: string;
+	file: string;
+	startedAt: number;
+}
+
+/** Sent after long waits on background tasks, which hold off evaluation. */
+export function checkinPrompt(condition: string, tasks: readonly RunningTask[], now: number): string {
+	const list = tasks.map(
+		(t) => `- ${t.id} (${formatDuration(now - t.startedAt)}): ${oneLine(t.label, 200)} · output: ${t.file}`,
+	);
+	return `[Goal check-in] The goal is evaluated once no background tasks are running. Still running:
+${list.join("\n")}
+Check their output, and stop any that are no longer needed.
+
+${block(condition)}`;
+}
+
 export function clearedPrompt(condition: string): string {
 	return `[Goal cleared by the user] Stop working toward it.\n\n${block(condition)}`;
 }

@@ -24,6 +24,7 @@ import type {
 import { Box, matchesKey, Text } from "@earendil-works/pi-tui";
 import { effectiveThinking, findModel, loadConfig } from "./config.ts";
 import {
+	checkinPrompt,
 	clearedPrompt,
 	DEFAULT_CONFIG,
 	evaluationsText,
@@ -38,6 +39,7 @@ import {
 	parseCommand,
 	parseVerdict,
 	progressLine,
+	type RunningTask,
 	STATE_TYPE,
 	startPrompt,
 	USAGE,
@@ -50,9 +52,12 @@ const JUDGE_TIMEOUT_MS = 180_000;
 const JUDGE_ATTEMPTS = 2;
 /** Room for the judge prompt (condition included) on top of the replayed context. */
 const JUDGE_PROMPT_TOKENS = 2048;
+/** Waits on background tasks before each check-in, and the most check-ins between prompts. */
+const CHECKIN_DELAYS_MS = [30 * 60_000, 60 * 60_000, 120 * 60_000];
+const MAX_CHECKINS = 3;
 
 interface Details {
-	kind: "start" | "resume" | "verdict" | "cleared";
+	kind: "start" | "resume" | "verdict" | "cleared" | "checkin";
 	condition: string;
 	verdict?: Verdict;
 	reason?: string;
@@ -60,6 +65,8 @@ interface Details {
 	elapsedMs?: number;
 	model?: string;
 	ms?: number;
+	/** Check-ins: background tasks still running. */
+	tasks?: number;
 }
 
 type Judgment =
@@ -82,6 +89,11 @@ export default function (pi: ExtensionAPI) {
 	/** Evaluator model id while a judgment runs (pi's own loader is gone by then). */
 	let judging: string | undefined;
 	const warned = new Set<string>();
+	/** Running background tasks, from the tasks extension. Evaluation waits for them. */
+	let tasks: RunningTask[] = [];
+	/** Check-ins sent since the user's last prompt, and the next one's timer. */
+	let checkins = 0;
+	let checkinTimer: NodeJS.Timeout | undefined;
 	/** ~/.pi/agent/goal.json, loaded at session start. */
 	let config: GoalConfig = { ...DEFAULT_CONFIG };
 
@@ -97,7 +109,9 @@ export default function (pi: ExtensionAPI) {
 			? "held"
 			: judging
 				? "judging"
-				: "active";
+				: tasks.length
+					? "waiting"
+					: "active";
 		const text = `◎ /goal ${state} · ${formatDuration(Date.now() - goal.startedAt)}`;
 		ctx.ui.setStatus("goal", ctx.ui.theme.fg(held ? "warning" : "accent", text));
 	}
@@ -120,6 +134,7 @@ export default function (pi: ExtensionAPI) {
 
 	/** A new iteration not started by our continuation. */
 	function freshIteration() {
+		checkins = 0;
 		fromGoal = false;
 		toolCalls = 0;
 		stalls = 0;
@@ -146,6 +161,7 @@ export default function (pi: ExtensionAPI) {
 		lastFinished = snaps.lastFinished;
 		held = undefined;
 		judging = undefined;
+		clearTimeout(checkinTimer);
 		freshIteration();
 		if (goal && announce) {
 			notify(
@@ -154,6 +170,25 @@ export default function (pi: ExtensionAPI) {
 			);
 		}
 		showStatus(ctx);
+	}
+
+	function armCheckin(ctx: ExtensionContext) {
+		clearTimeout(checkinTimer);
+		if (checkins >= MAX_CHECKINS) return;
+		const delay = CHECKIN_DELAYS_MS[Math.min(checkins, CHECKIN_DELAYS_MS.length - 1)];
+		checkinTimer = setTimeout(() => {
+			if (!goal || held || !tasks.length || !ctx.isIdle()) return;
+			checkins++;
+			pi.sendMessage(
+				{
+					customType: MESSAGE_TYPE,
+					content: checkinPrompt(goal.condition, tasks, Date.now()),
+					display: true,
+					details: { kind: "checkin", condition: goal.condition, tasks: tasks.length } satisfies Details,
+				},
+				{ triggerTurn: true },
+			);
+		}, delay);
 	}
 
 	/** Send a directive: start a turn when idle, steer it into the running one otherwise. */
@@ -295,6 +330,16 @@ export default function (pi: ExtensionAPI) {
 	// -------------------------------------------------------------------------
 
 	pi.on("session_start", (_event, ctx) => restore(ctx, true));
+	pi.on("session_shutdown", () => {
+		clearTimeout(checkinTimer);
+		tasks = [];
+	});
+	pi.events.on("tasks:running", (list) => {
+		tasks = Array.isArray(list) ? list : [];
+		if (!tasks.length) clearTimeout(checkinTimer);
+	});
+	// Any run means the wait is not idle: the next deferral re-arms the check-in.
+	pi.on("agent_start", () => clearTimeout(checkinTimer));
 	pi.on("session_tree", (_event, ctx) => restore(ctx, false));
 
 	pi.on("message_end", (event, ctx) => {
@@ -336,6 +381,8 @@ export default function (pi: ExtensionAPI) {
 		if (event.outcome === "error") return hold("the last model request failed");
 		// Queued user input runs next anyway; judge at the following settle.
 		if (event.context.pendingMessages.length > 0) return;
+		// Each task's report starts a turn; judge after the last one. Long waits get check-ins.
+		if (tasks.length) return void armCheckin(ctx);
 
 		const model = judgeModel(ctx);
 		if (!model) return hold("no evaluator model");
@@ -546,6 +593,12 @@ export default function (pi: ExtensionAPI) {
 				);
 		} else if (d.kind === "cleared") {
 			lines.push(theme.fg("muted", theme.bold("◎ Goal cleared")), dim(condition));
+		} else if (d.kind === "checkin") {
+			const n = d.tasks ?? 0;
+			lines.push(
+				theme.fg("accent", "◎ Goal check-in") + dim(` · ${n} background task${n === 1 ? "" : "s"} running`),
+				dim(condition),
+			);
 		} else {
 			const title = d.kind === "start" ? "◎ Goal set" : "◎ Goal resumed";
 			lines.push(theme.fg("accent", theme.bold(title)), condition);
