@@ -24,6 +24,7 @@ import type {
 import { Box, matchesKey, Text } from "@earendil-works/pi-tui";
 import { effectiveThinking, findModel, loadConfig } from "./config.ts";
 import {
+	carriesCondition,
 	checkinPrompt,
 	clearedPrompt,
 	DEFAULT_CONFIG,
@@ -33,12 +34,15 @@ import {
 	formatTokens,
 	type GoalConfig,
 	type GoalState,
+	ITEM_EVENT,
+	ITEM_STOP_EVENT,
 	judgePrompt,
 	MESSAGE_TYPE,
 	oneLine,
 	parseCommand,
 	parseVerdict,
 	progressLine,
+	reminderPrompt,
 	type RunningTask,
 	STATE_TYPE,
 	startPrompt,
@@ -52,12 +56,11 @@ const JUDGE_TIMEOUT_MS = 180_000;
 const JUDGE_ATTEMPTS = 2;
 /** Room for the judge prompt (condition included) on top of the replayed context. */
 const JUDGE_PROMPT_TOKENS = 2048;
-/** Waits on background tasks before each check-in, and the most check-ins between prompts. */
-const CHECKIN_DELAYS_MS = [30 * 60_000, 60 * 60_000, 120 * 60_000];
+/** Check-ins between prompts; each waits twice as long as the one before. */
 const MAX_CHECKINS = 3;
 
 interface Details {
-	kind: "start" | "resume" | "verdict" | "cleared" | "checkin";
+	kind: "start" | "resume" | "verdict" | "cleared" | "checkin" | "reminder";
 	condition: string;
 	verdict?: Verdict;
 	reason?: string;
@@ -70,7 +73,7 @@ interface Details {
 }
 
 type Judgment =
-	| { ok: true; verdict: Verdict; reason: string; ms: number }
+	| { ok: true; verdict: Verdict; reason: string; ms: number; input: number; output: number }
 	| { ok: false; aborted: boolean; error: string };
 
 export default function (pi: ExtensionAPI) {
@@ -96,15 +99,20 @@ export default function (pi: ExtensionAPI) {
 	let checkinTimer: NodeJS.Timeout | undefined;
 	/** ~/.pi/agent/goal.json, loaded at session start. */
 	let config: GoalConfig = { ...DEFAULT_CONFIG };
+	/** The session's context, for actions that come from other extensions (`/tasks`). */
+	let session: ExtensionContext | undefined;
 
 	function notify(ctx: ExtensionContext, text: string, level: "info" | "warning" = "info") {
 		if (ctx.hasUI) ctx.ui.notify(text, level);
 	}
 
-	/** `◎ /goal active · 2m`; `/goal` shows the rest. */
+	/** `◎ /goal active · 2m · 3 evals` in the footer, and the goal's row in /tasks; `/goal` shows the rest. */
 	function showStatus(ctx: ExtensionContext) {
-		if (!ctx.hasUI) return;
-		if (!goal) return ctx.ui.setStatus("goal", undefined);
+		if (!goal) {
+			pi.events.emit(ITEM_EVENT, { key: "goal", remove: true });
+			if (ctx.hasUI) ctx.ui.setStatus("goal", undefined);
+			return;
+		}
 		const state = held
 			? "held"
 			: judging
@@ -112,7 +120,18 @@ export default function (pi: ExtensionAPI) {
 				: tasks.length
 					? "waiting"
 					: "active";
-		const text = `◎ /goal ${state} · ${formatDuration(Date.now() - goal.startedAt)}`;
+		const n = goal.evaluations;
+		const evals = n ? ` · ${n} eval${n === 1 ? "" : "s"}` : "";
+		pi.events.emit(ITEM_EVENT, {
+			key: "goal",
+			icon: "◎",
+			label: goal.condition,
+			state: `${held ? `held: ${held}` : state}${evals}`,
+			startedAt: goal.startedAt,
+			stoppable: true,
+		});
+		if (!ctx.hasUI) return;
+		const text = `◎ /goal ${state} · ${formatDuration(Date.now() - goal.startedAt)}${evals}`;
 		ctx.ui.setStatus("goal", ctx.ui.theme.fg(held ? "warning" : "accent", text));
 	}
 
@@ -143,21 +162,23 @@ export default function (pi: ExtensionAPI) {
 	/** The user takes over: release a hold into a fresh window. */
 	function release(ctx: ExtensionContext) {
 		freshIteration();
-		if (held && goal) goal = { ...goal, startedAt: Date.now(), evaluations: 0 };
+		if (held && goal) goal = { ...goal, startedAt: Date.now(), evaluations: 0, judge: undefined };
 		held = undefined;
 		showStatus(ctx);
 	}
 
 	function restore(ctx: ExtensionContext, announce: boolean) {
+		session = ctx;
 		if (announce) {
 			const loaded = loadConfig();
 			config = loaded.config;
 			if (loaded.error)
 				notify(ctx, `goal config ignored (${loaded.error}); using defaults.`, "warning");
+			else if (loaded.ignored) notify(ctx, `goal config: ${loaded.ignored}.`, "warning");
 		}
 		const snaps = findSnapshots(ctx.sessionManager.getBranch());
 		// The condition carries over, counters restart, nothing auto-runs.
-		goal = snaps.current && { ...snaps.current, startedAt: Date.now(), evaluations: 0 };
+		goal = snaps.current && { ...snaps.current, startedAt: Date.now(), evaluations: 0, judge: undefined };
 		lastFinished = snaps.lastFinished;
 		held = undefined;
 		judging = undefined;
@@ -174,15 +195,15 @@ export default function (pi: ExtensionAPI) {
 
 	function armCheckin(ctx: ExtensionContext) {
 		clearTimeout(checkinTimer);
-		if (checkins >= MAX_CHECKINS) return;
-		const delay = CHECKIN_DELAYS_MS[Math.min(checkins, CHECKIN_DELAYS_MS.length - 1)];
+		if (checkins >= MAX_CHECKINS || config.checkinMinutes === 0) return;
+		const delay = config.checkinMinutes * 60_000 * 2 ** checkins;
 		checkinTimer = setTimeout(() => {
 			if (!goal || held || !tasks.length || !ctx.isIdle()) return;
 			checkins++;
 			pi.sendMessage(
 				{
 					customType: MESSAGE_TYPE,
-					content: checkinPrompt(goal.condition, tasks, Date.now()),
+					content: checkinPrompt(goal.condition, tasks, Date.now(), checkins === MAX_CHECKINS),
 					display: true,
 					details: { kind: "checkin", condition: goal.condition, tasks: tasks.length } satisfies Details,
 				},
@@ -302,6 +323,8 @@ export default function (pi: ExtensionAPI) {
 						reasoning: thinking === "off" ? undefined : thinking,
 						toolChoice: "none", // the replayed context declares the worker's tools
 						sessionId: ctx.sessionManager.getSessionId(),
+						// A side request: it must not take over the session's server-side thread.
+						disableContinuation: true,
 					})
 					.result();
 				if (signal.aborted) return { ok: false, aborted: true, error: "aborted" };
@@ -313,7 +336,9 @@ export default function (pi: ExtensionAPI) {
 				}
 				const text = reply.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("\n");
 				const parsed = parseVerdict(text);
-				if (parsed) return { ok: true, ...parsed, ms: Date.now() - started };
+				const u = reply.usage;
+				const tokens = { input: (u?.input ?? 0) + (u?.cacheWrite ?? 0), output: u?.output ?? 0 };
+				if (parsed) return { ok: true, ...parsed, ms: Date.now() - started, ...tokens };
 				error = text.trim()
 					? `unreadable reply "${oneLine(text, 80)}"`
 					: `empty reply (${reply.stopReason})`;
@@ -341,6 +366,31 @@ export default function (pi: ExtensionAPI) {
 	// Any run means the wait is not idle: the next deferral re-arms the check-in.
 	pi.on("agent_start", () => clearTimeout(checkinTimer));
 	pi.on("session_tree", (_event, ctx) => restore(ctx, false));
+
+	// Compaction can summarize away every message that carried the condition
+	// (before the first verdict, only the directive does): restate it.
+	pi.on("session_compact", (_event, ctx) => {
+		const g = goal;
+		if (!g) return;
+		const kept = ctx.sessionManager
+			.buildContextEntries()
+			.some((e) => e.type === "custom_message" && carriesCondition(e.content, g.condition));
+		if (kept) return;
+		pi.sendMessage(
+			{
+				customType: MESSAGE_TYPE,
+				content: reminderPrompt(g.condition),
+				display: true,
+				details: { kind: "reminder", condition: g.condition } satisfies Details,
+			},
+			ctx.isIdle() ? { triggerTurn: false } : { deliverAs: "steer" },
+		);
+	});
+
+	// `x` on the goal's row in /tasks.
+	pi.events.on(ITEM_STOP_EVENT, (data) => {
+		if ((data as { key?: string })?.key === "goal" && session) clear(session);
+	});
 
 	pi.on("message_end", (event, ctx) => {
 		if (event.message.role === "user") release(ctx);
@@ -424,6 +474,10 @@ export default function (pi: ExtensionAPI) {
 						? "failed"
 						: "active",
 			evaluations: current.evaluations + 1,
+			judge: {
+				input: (current.judge?.input ?? 0) + result.input,
+				output: (current.judge?.output ?? 0) + result.output,
+			},
 			last: {
 				verdict: result.verdict,
 				reason: result.reason,
@@ -472,6 +526,23 @@ export default function (pi: ExtensionAPI) {
 	// /goal
 	// -------------------------------------------------------------------------
 
+	function clear(ctx: ExtensionContext) {
+		if (!goal) return notify(ctx, "No goal set.");
+		const { condition } = goal;
+		save({ ...goal, status: "cleared", endedAt: Date.now() }, ctx);
+		// Mid-run: steer so the worker stops early. Otherwise just record it.
+		pi.sendMessage(
+			{
+				customType: MESSAGE_TYPE,
+				content: clearedPrompt(condition),
+				display: true,
+				details: { kind: "cleared", condition } satisfies Details,
+			},
+			ctx.isIdle() ? { triggerTurn: false } : { deliverAs: "steer" },
+		);
+		notify(ctx, `Goal cleared: ${oneLine(condition, 120)}`);
+	}
+
 	pi.registerCommand("goal", {
 		description:
 			"Work until a condition holds, judged by an evaluator model: /goal <condition> | clear | resume",
@@ -506,29 +577,17 @@ export default function (pi: ExtensionAPI) {
 				if (goal) {
 					const model = judgeModel(ctx);
 					const label = model ? `${model.provider}/${model.id}` : "none";
+					const used = g.judge
+						? ` · ↑${formatTokens(g.judge.input)} ↓${formatTokens(g.judge.output)} tokens`
+						: "";
 					lines.push(
-						`Evaluator: ${label} · thinking ${effectiveThinking(model, config.thinking)}`,
+						`Evaluator: ${label} · thinking ${effectiveThinking(model, config.thinking)}${used}`,
 					);
 				}
 				return notify(ctx, lines.join("\n"));
 			}
 
-			if (cmd.kind === "clear") {
-				if (!goal) return notify(ctx, "No goal set.");
-				const { condition } = goal;
-				save({ ...goal, status: "cleared", endedAt: now }, ctx);
-				// Mid-run: steer so the worker stops early. Otherwise just record it.
-				pi.sendMessage(
-					{
-						customType: MESSAGE_TYPE,
-						content: clearedPrompt(condition),
-						display: true,
-						details: { kind: "cleared", condition } satisfies Details,
-					},
-					ctx.isIdle() ? { triggerTurn: false } : { deliverAs: "steer" },
-				);
-				return notify(ctx, `Goal cleared: ${oneLine(condition, 120)}`);
-			}
+			if (cmd.kind === "clear") return clear(ctx);
 
 			if (cmd.kind === "resume") {
 				if (!goal)
@@ -593,6 +652,8 @@ export default function (pi: ExtensionAPI) {
 				);
 		} else if (d.kind === "cleared") {
 			lines.push(theme.fg("muted", theme.bold("◎ Goal cleared")), dim(condition));
+		} else if (d.kind === "reminder") {
+			lines.push(theme.fg("accent", "◎ Goal restated after compaction"), dim(condition));
 		} else if (d.kind === "checkin") {
 			const n = d.tasks ?? 0;
 			lines.push(

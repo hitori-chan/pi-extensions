@@ -135,19 +135,23 @@ describe("parseConfig", () => {
 				thinking: "huge",
 				stallTurns: 1.5,
 				model: "nomodel",
+				checkinMinutes: 99_999,
+				maxTurns: "unlimited",
 			}),
-			DEFAULT_CONFIG,
+			{ ...DEFAULT_CONFIG, ignored: ["maxTurns", "thinking", "stallTurns", "checkinMinutes", "model"] },
 		);
 		assert.deepEqual(
 			parseConfig({
 				model: "cloud/small",
 				thinking: "xhigh",
 				stallTurns: 0,
+				checkinMinutes: 0,
 			}),
 			{
 				model: "cloud/small",
 				thinking: "xhigh",
 				stallTurns: 0,
+				checkinMinutes: 0,
 			},
 		);
 	});
@@ -228,6 +232,8 @@ function harness(
 	const models = [session, small, mid];
 
 	const channels = new Map<string, (data: unknown) => void>();
+	/** What compaction kept: the active branch's context entries. */
+	let contextEntries: any[] = [];
 	const pi: any = {
 		on: (name: string, h: Handler) => void handlers.set(name, [...(handlers.get(name) ?? []), h]),
 		events: {
@@ -253,7 +259,11 @@ function harness(
 			onTerminalInput: () => () => {},
 			theme: { fg: (_c: string, t: string) => t },
 		},
-		sessionManager: { getBranch: () => branch, getSessionId: () => "sid" },
+		sessionManager: {
+			getBranch: () => branch,
+			getSessionId: () => "sid",
+			buildContextEntries: () => contextEntries,
+		},
 		modelRegistry: {
 			getAvailable: () => models,
 			find: (p: string, id: string) => models.find((m) => m.provider === p && m.id === id),
@@ -263,7 +273,11 @@ function harness(
 				return {
 					result: async () => {
 						const text = typeof next === "function" ? await next() : next;
-						return { stopReason: "stop", content: [{ type: "text", text }] };
+						return {
+							stopReason: "stop",
+							content: [{ type: "text", text }],
+							usage: { input: 40, output: 5, cacheRead: 9_000, cacheWrite: 10 },
+						};
 					},
 				};
 			},
@@ -319,6 +333,8 @@ function harness(
 				message: { role: "assistant", timestamp: at, usage: { input, output, cacheRead: 0, cacheWrite: 0 } },
 			}),
 		verdict,
+		events: pi.events,
+		kept: (entries: any[]) => void (contextEntries = entries),
 		status: () => status,
 		reply: (...r: (string | (() => Promise<string>))[]) => void (replies = r),
 		goal: (args: string) => commands.get("goal")!.handler(args, ctx),
@@ -404,7 +420,7 @@ describe("goal loop", () => {
 		const held = await h.settle();
 		assert.equal(held.continue, undefined);
 		assert.equal(held.entries.length, 2); // the verdict is still recorded
-		assert.match(h.status() ?? "", /^◎ \/goal held · \d+s$/);
+		assert.match(h.status() ?? "", /^◎ \/goal held · \d+s · 4 evals$/);
 		assert.equal(h.notes.length, 0); // announced only once the run settles…
 		await h.emit("agent_settled", { aborted: false });
 		assert.match(h.notes.at(-1)!, /^Goal held: 3 turns in a row/); // …after the verdict is on screen
@@ -433,7 +449,7 @@ describe("goal loop", () => {
 			await h.turn(1);
 			assert.equal((await h.settle()).continue, true, `evaluation ${i + 1}`);
 		}
-		assert.match(h.status() ?? "", /^◎ \/goal active · \d+s$/);
+		assert.match(h.status() ?? "", /^◎ \/goal active · \d+s · 60 evals$/);
 		await h.goal("");
 		assert.match(h.notes.at(-1)!, /\n60 evaluations ·/);
 	});
@@ -491,6 +507,8 @@ describe("goal loop", () => {
 			assert.equal(checkins().length, 3); // capped until the next prompt
 			const [first] = checkins();
 			assert.deepEqual(first.options, { triggerTurn: true });
+			assert.doesNotMatch(first.message.content, /last check-in/);
+			assert.match(checkins()[2].message.content, /This is the last check-in until the user's next prompt\./);
 			assert.match(
 				first.message.content,
 				/^\[Goal check-in\] The goal is evaluated once no background tasks are running\. Still running:\n- t0 \(\d+s\): npm run dev · output: \/tmp\/t0\.log\n- t1/,
@@ -514,6 +532,71 @@ describe("goal loop", () => {
 		} finally {
 			mock.timers.reset();
 		}
+	});
+
+	it("checkinMinutes sets the first check-in; 0 turns them off", async () => {
+		mock.timers.enable({ apis: ["setTimeout"] });
+		try {
+			for (const [minutes, expected] of [
+				[1, 1],
+				[0, 0],
+			]) {
+				h = harness({ config: { checkinMinutes: minutes } });
+				await h.emit("session_start", { reason: "startup" });
+				await h.goal("dev server answers");
+				h.tasksRunning(1);
+				await h.settle();
+				mock.timers.tick(60_000);
+				const sent = h.sent.filter((s) => s.message.details.kind === "checkin").length;
+				assert.equal(sent, expected, `checkinMinutes ${minutes}`);
+				await h.emit("session_shutdown");
+			}
+		} finally {
+			mock.timers.reset();
+		}
+	});
+
+	it("judges as a side request and counts the evaluator's tokens", async () => {
+		await h.goal("tests pass");
+		h.reply(h.verdict("not_met"), h.verdict("not_met"));
+		await h.settle();
+		await h.settle();
+		assert.equal(h.judgeCalls[0].options.disableContinuation, true);
+		assert.equal(h.judgeCalls[0].options.sessionId, "sid");
+		await h.goal("");
+		assert.match(h.notes.at(-1)!, /Evaluator: local\/big · thinking off · ↑100 ↓10 tokens/);
+		await h.settle({ outcome: "error" }); // held
+		await h.userPrompt(); // released into a new window: counters and spend reset
+		await h.goal("");
+		assert.match(h.notes.at(-1)!, /Evaluator: local\/big · thinking off$/m);
+	});
+
+	it("restates the condition when compaction dropped every message carrying it", async () => {
+		await h.goal("tests pass");
+		const directive = h.sent[0].message;
+		h.kept([{ type: "custom_message", customType: MESSAGE_TYPE, content: directive.content }]);
+		await h.emit("session_compact", {});
+		assert.equal(h.sent.length, 1); // still in context
+		h.kept([{ type: "compaction", summary: "…" }]);
+		await h.emit("session_compact", {});
+		const reminder = h.sent[1];
+		assert.equal(reminder.message.details.kind, "reminder");
+		assert.match(reminder.message.content, /^\[Goal active\] Keep working[\s\S]*<goal_condition>\ntests pass\n<\/goal_condition>$/);
+		assert.deepEqual(reminder.options, { triggerTurn: false });
+	});
+
+	it("lists the goal in /tasks, where x clears it", async () => {
+		const items: any[] = [];
+		h.events.on("tasks:item", (item: unknown) => void items.push(item));
+		await h.goal("tests pass");
+		assert.deepEqual(
+			{ ...items.at(-1), startedAt: 0 },
+			{ key: "goal", icon: "◎", label: "tests pass", state: "active", startedAt: 0, stoppable: true },
+		);
+		h.events.emit("tasks:item-stop", { key: "goal" });
+		assert.deepEqual(items.at(-1), { key: "goal", remove: true });
+		assert.equal(h.branch.at(-1).data.status, "cleared");
+		assert.match(h.notes.at(-1)!, /^Goal cleared: tests pass/);
 	});
 
 	it("/goal shows the tokens spent since the goal was set", async () => {
@@ -572,7 +655,7 @@ describe("goal loop", () => {
 		await h.settle();
 		assert.equal(h.judgeCalls[0].model.id, "small");
 		assert.equal(h.judgeCalls[0].options.reasoning, "low");
-		assert.match(h.status() ?? "", /^◎ \/goal active · \d+s$/);
+		assert.match(h.status() ?? "", /^◎ \/goal active · \d+s · 1 eval$/);
 
 		h.reply(h.verdict("not_met"));
 		h.ctx.getContextUsage = () => ({ tokens: 12_000 }); // + headroom > 16k window
@@ -607,6 +690,12 @@ describe("goal loop", () => {
 		assert.equal(h.judgeCalls[0].options.maxTokens, 16384);
 		await h.goal("");
 		assert.match(h.notes.at(-1)!, /Evaluator: local\/big · thinking xhigh/);
+	});
+
+	it("names config keys it ignores", async () => {
+		h = harness({ config: { stallTurns: 2, maxTurns: "unlimited" } });
+		await h.emit("session_start", { reason: "startup" });
+		assert.match(h.notes.at(-1)!, /^goal config: .*goal\.json: ignored maxTurns\.$/);
 	});
 
 	it("honors stallTurns 0; warns on a broken config file", async () => {

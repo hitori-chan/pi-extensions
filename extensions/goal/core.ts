@@ -10,6 +10,9 @@ export const STATE_TYPE = "goal-state";
 export const MESSAGE_TYPE = "goal";
 export const MAX_CONDITION_CHARS = 4000;
 export const USAGE = "Usage: /goal <condition> | clear | resume";
+/** The tasks extension's channels for listing work in `/tasks` and stopping it there (plain data). */
+export const ITEM_EVENT = "tasks:item";
+export const ITEM_STOP_EVENT = "tasks:item-stop";
 
 export type Verdict = "met" | "not_met" | "impossible";
 
@@ -25,6 +28,8 @@ export interface GoalState {
 	evaluations: number;
 	endedAt?: number;
 	last?: { verdict: Verdict; reason: string; at: number; model: string; ms: number };
+	/** Evaluator tokens in the current window. */
+	judge?: { input: number; output: number };
 }
 
 // ---------------------------------------------------------------------------
@@ -41,25 +46,38 @@ export interface GoalConfig {
 	thinking: Thinking;
 	/** Goal-driven turns in a row without tool use before the loop is held; 0 = never. */
 	stallTurns: number;
+	/** Minutes of waiting on background tasks before the first check-in (then doubling); 0 = none. */
+	checkinMinutes: number;
 }
 
 export const DEFAULT_CONFIG: Readonly<GoalConfig> = {
 	thinking: "off",
 	stallTurns: 3,
+	checkinMinutes: 30,
 };
 
-/** Unknown or invalid fields fall back to defaults. */
-export function parseConfig(raw: unknown): GoalConfig {
+const CONFIG_KEYS = ["model", "thinking", "stallTurns", "checkinMinutes"];
+
+/** Invalid fields fall back to defaults; `ignored` names keys that are unknown or invalid. */
+export function parseConfig(raw: unknown): GoalConfig & { ignored?: string[] } {
 	const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
-	const count = (v: unknown, fallback: number) =>
-		typeof v === "number" && Number.isInteger(v) && v >= 0 ? v : fallback;
-	const config: GoalConfig = {
-		thinking: THINKING_LEVELS.includes(r.thinking as Thinking)
-			? (r.thinking as Thinking)
-			: DEFAULT_CONFIG.thinking,
-		stallTurns: count(r.stallTurns, DEFAULT_CONFIG.stallTurns),
+	const ignored = Object.keys(r).filter((k) => !CONFIG_KEYS.includes(k));
+	const count = (key: string, fallback: number, max = Number.MAX_SAFE_INTEGER) => {
+		const v = r[key];
+		if (typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= max) return v;
+		if (v !== undefined) ignored.push(key);
+		return fallback;
+	};
+	const thinking = THINKING_LEVELS.includes(r.thinking as Thinking) ? (r.thinking as Thinking) : undefined;
+	if (r.thinking !== undefined && !thinking) ignored.push("thinking");
+	const config: GoalConfig & { ignored?: string[] } = {
+		thinking: thinking ?? DEFAULT_CONFIG.thinking,
+		stallTurns: count("stallTurns", DEFAULT_CONFIG.stallTurns),
+		checkinMinutes: count("checkinMinutes", DEFAULT_CONFIG.checkinMinutes, 10_080),
 	};
 	if (typeof r.model === "string" && /^[^/\s]+\/\S+$/.test(r.model)) config.model = r.model;
+	else if (r.model !== undefined) ignored.push("model");
+	if (ignored.length) config.ignored = ignored;
 	return config;
 }
 
@@ -196,15 +214,37 @@ export interface RunningTask {
 }
 
 /** Sent after long waits on background tasks, which hold off evaluation. */
-export function checkinPrompt(condition: string, tasks: readonly RunningTask[], now: number): string {
+export function checkinPrompt(
+	condition: string,
+	tasks: readonly RunningTask[],
+	now: number,
+	last = false,
+): string {
 	const list = tasks.map(
 		(t) => `- ${t.id} (${formatDuration(now - t.startedAt)}): ${oneLine(t.label, 200)} · output: ${t.file}`,
 	);
+	const pause = last ? "\nThis is the last check-in until the user's next prompt." : "";
 	return `[Goal check-in] The goal is evaluated once no background tasks are running. Still running:
 ${list.join("\n")}
-Check their output, and stop any that are no longer needed.
+Check their output, and stop any that are no longer needed.${pause}
 
 ${block(condition)}`;
+}
+
+/** After compaction dropped every message that carried the condition. */
+export function reminderPrompt(condition: string): string {
+	return `[Goal active] Keep working until this condition holds; an evaluator judges it after each of your turns.\n\n${block(condition)}`;
+}
+
+/** Whether a message's text carries the condition block. */
+export function carriesCondition(content: unknown, condition: string): boolean {
+	const text =
+		typeof content === "string"
+			? content
+			: Array.isArray(content)
+				? content.map((b: { text?: string }) => b?.text ?? "").join("")
+				: "";
+	return text.includes(block(condition));
 }
 
 export function clearedPrompt(condition: string): string {

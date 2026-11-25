@@ -41,15 +41,15 @@ The loop is pi's `agent_before_settle` boundary, which plays the role of a
 Stop hook: pi awaits it after its own retries and compaction, and it can
 append entries and request one more model turn. Each verdict is a `goal`
 message. The model sees it, and the TUI renders it as one line (ctrl+o
-expands it). Every "not met" verdict restates the condition, so the condition
-survives compaction.
+expands it). Every "not met" verdict restates the condition, and when
+compaction drops every message that carried it, a short reminder restates it.
 
 The loop stops in these cases:
 
 | Situation                                             | What happens                                                                                                                    |
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | Esc                                                   | The loop stops and the goal stays active. Esc while the evaluator runs also cancels that call.                                  |
-| Held                                                  | The loop pauses with the reason in a notice. Your next prompt, or `/goal resume`, continues in a fresh window (counters reset).  |
+| Held                                                  | The loop pauses with the reason in a notice. Your next prompt, or `/goal resume`, continues in a fresh window (counters reset). |
 | Restore (`/reload`, `--continue`, `/resume`, `/fork`) | The condition carries over and the counters reset. Nothing runs until your next prompt or `/goal resume`.                       |
 
 A goal is held when:
@@ -58,11 +58,15 @@ A goal is held when:
 - a model request fails after pi's own retries,
 - or the evaluator fails twice.
 
-While [background tasks](../tasks) run, evaluation waits. Each task's report
-starts a turn, and the goal is judged once none are running; the footer shows
-the wait. If the agent sits idle waiting, a check-in lists the running tasks
-and asks it to check their output. Check-ins come after 30 minutes, then 1 hour,
-then 2 hours, at most three between your prompts.
+While [background tasks and agents](../tasks) run, evaluation waits. Each
+task's report starts a turn, and the goal is judged once none are running; the
+footer shows the wait. If the agent sits idle waiting, a check-in lists the
+running tasks and asks it to check their output. Check-ins come after
+`checkinMinutes` (30 by default), then twice and four times that, at most three
+between your prompts; the third says it is the last.
+
+The footer shows `◎ /goal active · 12m · 3 evals`, and `/tasks` lists the goal
+next to the tasks, where `x` clears it.
 
 ## Evaluator
 
@@ -78,13 +82,16 @@ one more user turn, with `toolChoice: "none"`. This makes it:
   across evaluations too, because the prefix only grows.
 - **Portable.** Pi replays a session's messages to any model, the same way
   mid-session model switching works.
+- **A side request.** It never takes over the session's server-side
+  continuation (Anthropic message threads), so the agent's next request
+  continues its own thread.
 
 The rubric: `met` needs tool output from the real target, produced after the
 last relevant change; the agent's own statements don't count. `impossible`
 means the agent has shown the condition can't be met, or a limit written in
 the condition was reached. Replies are a JSON object; parsing tolerates
 `<think>` blocks, code fences, and prose. A failed call or unreadable reply is
-retried once.
+retried once. `/goal` shows the evaluator's tokens next to the agent's.
 
 ## Settings
 
@@ -92,14 +99,17 @@ Optional, in `~/.pi/agent/goal.json`. It is read at session start, so run
 `/reload` after editing.
 
 ```json
-{ "model": "provider/id", "thinking": "off", "stallTurns": 3 }
+{ "model": "provider/id", "thinking": "off", "stallTurns": 3, "checkinMinutes": 30 }
 ```
 
-| Key          | Default       | Meaning                                                                                                                       |
-| ------------ | ------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `model`      | session model | evaluator model. Falls back to the session model if it is missing or its context window is too small for the conversation    |
-| `thinking`   | `off`         | evaluator reasoning effort, `off` to `max`, clamped to what the model supports                                                |
-| `stallTurns` | `3`           | goal-driven turns in a row without a tool call before the loop is held; `0` = off                                             |
+| Key              | Default       | Meaning                                                                                                                   |
+| ---------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `model`          | session model | evaluator model. Falls back to the session model if it is missing or its context window is too small for the conversation |
+| `thinking`       | `off`         | evaluator reasoning effort, `off` to `max`, clamped to what the model supports                                            |
+| `stallTurns`     | `3`           | goal-driven turns in a row without a tool call before the loop is held; `0` = off                                         |
+| `checkinMinutes` | `30`          | minutes of waiting on background tasks before the first check-in; `0` = no check-ins                                      |
+
+Unknown or invalid keys are named in a warning at session start.
 
 pi models reasoning effort as a single thinking level, so "effort" and
 "thinking" are one setting. For example, a llama.cpp chat template receives
@@ -121,7 +131,7 @@ both `enable_thinking` and `reasoning_effort` from it.
   local server doesn't lose your condition.
 - **Resume.** `/goal resume` exists; Claude Code has no equivalent.
 
-## Pi 1.5.2 notes (re-verify on upgrade)
+## Pi 1.6.0 notes (re-verify on upgrade)
 
 - **Abort.** `agent_before_settle` is skipped for aborted runs. Esc during
   the handler commits the returned entries but suppresses the continuation.

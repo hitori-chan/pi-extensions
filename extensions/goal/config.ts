@@ -8,11 +8,13 @@ import { DEFAULT_CONFIG, type GoalConfig, parseConfig, type Thinking } from "./c
 
 const configPath = () => join(getAgentDir(), "goal.json");
 
-export function loadConfig(): { config: GoalConfig; error?: string } {
+/** `error`: the file is unusable; `ignored`: keys that are unknown or invalid. */
+export function loadConfig(): { config: GoalConfig; error?: string; ignored?: string } {
 	const path = configPath();
 	if (!existsSync(path)) return { config: { ...DEFAULT_CONFIG } };
 	try {
-		return { config: parseConfig(JSON.parse(readFileSync(path, "utf8"))) };
+		const { ignored, ...config } = parseConfig(JSON.parse(readFileSync(path, "utf8")));
+		return { config, ignored: ignored && `${path}: ignored ${ignored.join(", ")}` };
 	} catch (err) {
 		return {
 			config: { ...DEFAULT_CONFIG },
