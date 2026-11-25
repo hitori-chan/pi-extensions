@@ -18,6 +18,10 @@ import { dirname } from "node:path";
 export const MESSAGE_TYPE = "task";
 /** `pi.events` channel carrying the running tasks, as `RunningTask[]`. */
 export const RUNNING_EVENT = "tasks:running";
+/** `pi.events` channel on which other extensions list their own work in `/tasks`, as `TaskItem`. */
+export const ITEM_EVENT = "tasks:item";
+/** `pi.events` channel on which `/tasks` asks an item's owner to stop it, as `{ key }`. */
+export const ITEM_STOP_EVENT = "tasks:item-stop";
 
 export interface RunningTask {
 	id: string;
@@ -26,10 +30,26 @@ export interface RunningTask {
 	file: string;
 	startedAt: number;
 }
+/** Another extension's work shown in `/tasks`, such as the goal. Plain data. */
+export interface TaskItem {
+	/** Unique across extensions, e.g. "goal". */
+	key: string;
+	icon: string;
+	label: string;
+	/** "active · 3 evaluations", "every 5m · next in 2m", … */
+	state: string;
+	startedAt?: number;
+	/** `x` in /tasks emits ITEM_STOP_EVENT for it. */
+	stoppable?: boolean;
+	/** Drop the item. */
+	remove?: boolean;
+}
+
 /** A foreground command's output stays in memory up to this, then goes to its log file. */
 const SPILL_BYTES = 1 << 20;
-/** Bytes read back for tails. */
+/** Bytes read back for tails, and for scrolling in /tasks. */
 const TAIL_BYTES = 16 * 1024;
+const VIEW_BYTES = 1 << 20;
 
 /**
  * A command's output: buffered in memory until `persist()` (or past 1 MiB),
@@ -44,9 +64,12 @@ export class Log {
 	private persisted = false;
 	/** Closed for good: later output (a child still holding the pipe) is dropped. */
 	private closed = false;
+	private readonly append: boolean;
 
-	constructor(path: string) {
+	/** `append` keeps what the file already holds (a resumed agent's transcript). */
+	constructor(path: string, options: { append?: boolean } = {}) {
 		this.path = path;
+		this.append = options.append ?? false;
 	}
 
 	write(data: Buffer): void {
@@ -67,7 +90,8 @@ export class Log {
 		this.persisted = true;
 		this.guard(() => {
 			mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
-			this.fd = openSync(this.path, "w", 0o600);
+			this.fd = openSync(this.path, this.append ? "a" : "w", 0o600);
+			if (this.append) this.size += fstatSync(this.fd).size;
 			for (const chunk of this.chunks) writeSync(this.fd, chunk);
 		});
 		this.chunks = [];
@@ -88,26 +112,40 @@ export class Log {
 
 	/** The last `lines` lines of output, at most `chars` characters, cleaned for display. */
 	tail(lines: number, chars: number): string {
-		let bytes: Buffer;
-		if (!this.persisted) bytes = Buffer.concat(this.chunks).subarray(-TAIL_BYTES);
-		else {
-			try {
-				const fd = openSync(this.path, "r");
-				try {
-					const size = fstatSync(fd).size;
-					const length = Math.min(size, TAIL_BYTES);
-					bytes = Buffer.alloc(length);
-					readSync(fd, bytes, 0, length, size - length);
-				} finally {
-					closeSync(fd);
-				}
-			} catch {
-				return "";
-			}
-		}
-		const text = clean(bytes.toString("utf8")).trimEnd();
+		const text = clean(this.last(TAIL_BYTES).toString("utf8")).trimEnd();
 		const last = text.split("\n").slice(-lines).join("\n");
 		return last.length > chars ? `…${last.slice(-(chars - 1))}` : last;
+	}
+
+	/**
+	 * Cleaned lines from the last `bytes` of output, for scrolling. `partial`
+	 * says earlier output was left out.
+	 */
+	lines(bytes = VIEW_BYTES): { lines: string[]; partial: boolean } {
+		const buf = this.last(bytes);
+		let text = clean(buf.toString("utf8")).trimEnd();
+		const partial = buf.length < this.size;
+		if (partial) text = text.slice(text.indexOf("\n") + 1); // drop the cut first line
+		return { lines: text ? text.split("\n") : [], partial };
+	}
+
+	/** The last `bytes` of output, from memory or the file. */
+	private last(bytes: number): Buffer {
+		if (!this.persisted) return Buffer.concat(this.chunks).subarray(-bytes);
+		try {
+			const fd = openSync(this.path, "r");
+			try {
+				const size = fstatSync(fd).size;
+				const length = Math.min(size, bytes);
+				const buf = Buffer.alloc(length);
+				readSync(fd, buf, 0, length, size - length);
+				return buf;
+			} finally {
+				closeSync(fd);
+			}
+		} catch {
+			return Buffer.alloc(0);
+		}
 	}
 
 	private guard(fn: () => unknown): void {
@@ -145,6 +183,24 @@ export function oneLine(text: string, max: number): string {
 	return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
 
+/** One line, keeping the start and the end of long text: `npm run build && … && npm test`. */
+export function clip(text: string, max: number): string {
+	const flat = text.replace(/\s+/g, " ").trim();
+	if (flat.length <= max) return flat;
+	const head = Math.ceil((max - 1) / 2);
+	return `${flat.slice(0, head)}…${flat.slice(flat.length - (max - 1 - head))}`;
+}
+
+/** Like pi's footer: 950, 1.2k, 45k, 1.3M. */
+export function formatTokens(n: number): string {
+	if (n < 1000) return String(n);
+	if (n < 10_000) return `${(n / 1000).toFixed(1)}k`;
+	if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
+	return `${(n / 1_000_000).toFixed(1)}M`;
+}
+
+export const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
 /** `details` of a task message. */
 export type TaskNotice =
 	| {
@@ -160,8 +216,12 @@ export type TaskNotice =
 			file: string;
 			/** Last lines of output (bash tasks). */
 			tail: string;
-			/** Notifications sent (monitors). */
+			/** Notifications sent (monitors), counting `lines`. */
 			events?: number;
+			/** Monitors: the lines printed just before the exit, delivered with it. */
+			lines?: string[];
+			/** Agents: what the agent said last, and what it took. */
+			agent?: { report: string; turns: number; input: number; output: number };
 	  }
 	| { kind: "event"; id: string; description: string; lines: string[]; more: number };
 
@@ -172,12 +232,19 @@ export function noticeText(n: TaskNotice): string {
 		return `[Monitor ${n.id}: ${n.description}]\n${n.lines.join("\n")}${more}`;
 	}
 	const took = formatDuration(n.ms);
+	if (n.agent) {
+		const a = n.agent;
+		const cost = `${plural(a.turns, "turn")}, ↑${formatTokens(a.input)} ↓${formatTokens(a.output)} tokens`;
+		const report = a.report.trim() || "(no final message)";
+		return `[Agent ${n.id}: ${n.description} — ${n.outcome} after ${took}, ${cost}]\n${report}\n\nTranscript: ${n.file}`;
+	}
 	if (n.description !== undefined) {
-		const events = `${n.events ?? 0} event${n.events === 1 ? "" : "s"}`;
-		return `[Monitor ${n.id}: ${n.description} — ${n.outcome} after ${took}, ${events}]\nOutput: ${n.file}`;
+		const events = plural(n.events ?? 0, "event");
+		const lines = n.lines?.length ? `\n${n.lines.join("\n")}` : "";
+		return `[Monitor ${n.id}: ${n.description} — ${n.outcome} after ${took}, ${events}]${lines}\nOutput: ${n.file}`;
 	}
 	const output = n.tail ? `\n${n.tail}` : "\n(no output)";
-	return `[Background task ${n.id} ${n.outcome} after ${took}]\n$ ${oneLine(n.command, 300)}${output}\n\nFull output: ${n.file}`;
+	return `[Background task ${n.id} ${n.outcome} after ${took}]\n$ ${clip(n.command, 300)}${output}\n\nFull output: ${n.file}`;
 }
 
 /** Splits a stream into complete lines; keeps the unfinished one for later. */

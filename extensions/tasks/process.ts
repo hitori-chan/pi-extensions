@@ -12,7 +12,11 @@ import { getShellConfig } from "@earendil-works/pi-coding-agent";
 
 /** After exit, wait this long for pipes held by descendants to fall idle (as pi does). */
 const EXIT_STDIO_GRACE_MS = 100;
-/** Every process a command starts inherits `PI_TASK=<tag>`, which finds them after re-parenting. */
+/**
+ * Every process a command starts inherits `PI_TASK=<tags>`, which finds them
+ * after re-parenting. Tags nest (`outer,inner`), so stopping a subagent also
+ * finds what its own tasks started.
+ */
 const TAG_VAR = "PI_TASK";
 
 export interface Proc {
@@ -22,29 +26,40 @@ export interface Proc {
 	kill(): void;
 }
 
+/**
+ * Run `command` through pi's shell, or a program directly when given
+ * `{ file, args }` (no shell, so arguments are never re-parsed).
+ */
 export function start(
-	command: string,
+	command: string | { file: string; args: string[] },
 	options: {
 		cwd: string;
 		env?: NodeJS.ProcessEnv;
 		shellPath?: string;
+		/** Written to the program's stdin (programs only; a shell reads the command there). */
+		input?: string;
 		onStdout: (data: Buffer) => void;
 		onStderr: (data: Buffer) => void;
 	},
 ): Proc {
-	const shell = getShellConfig(options.shellPath);
-	const stdin = shell.commandTransport === "stdin";
 	const tag = randomBytes(8).toString("hex");
-	const child = spawn(shell.shell, stdin ? shell.args : [...shell.args, command], {
+	const env = options.env ?? process.env;
+	const outer = env[TAG_VAR];
+	const shell = typeof command === "string" ? getShellConfig(options.shellPath) : undefined;
+	const stdin = shell ? shell.commandTransport === "stdin" : options.input !== undefined;
+	const [file, args] = shell
+		? [shell.shell, stdin ? shell.args : [...shell.args, command as string]]
+		: [(command as { file: string }).file, (command as { args: string[] }).args];
+	const child = spawn(file, args, {
 		cwd: options.cwd,
 		detached: process.platform !== "win32",
-		env: { ...(options.env ?? process.env), [TAG_VAR]: tag },
+		env: { ...env, [TAG_VAR]: outer ? `${outer},${tag}` : tag },
 		stdio: [stdin ? "pipe" : "ignore", "pipe", "pipe"],
 		windowsHide: true,
 	});
 	if (stdin) {
 		child.stdin?.on("error", () => {});
-		child.stdin?.end(command);
+		child.stdin?.end(shell ? (command as string) : options.input);
 	}
 	child.stdout?.on("data", options.onStdout);
 	child.stderr?.on("data", options.onStderr);
@@ -108,7 +123,7 @@ export function descendants(pid: number): number[] {
 /** Linux: processes carrying the tag, wherever they were re-parented. */
 function tagged(tag: string): number[] {
 	if (process.platform !== "linux") return [];
-	const needle = `\0${TAG_VAR}=${tag}\0`;
+	const prefix = `${TAG_VAR}=`;
 	const found: number[] = [];
 	let names: string[];
 	try {
@@ -120,7 +135,12 @@ function tagged(tag: string): number[] {
 		const pid = Number(name);
 		if (!pid) continue;
 		try {
-			if (`\0${readFileSync(`/proc/${pid}/environ`, "latin1")}`.includes(needle)) found.push(pid);
+			const environ = `\0${readFileSync(`/proc/${pid}/environ`, "latin1")}`;
+			const at = environ.indexOf(`\0${prefix}`);
+			if (at === -1) continue;
+			const end = environ.indexOf("\0", at + 1);
+			const tags = environ.slice(at + 1 + prefix.length, end === -1 ? undefined : end).split(",");
+			if (tags.includes(tag)) found.push(pid);
 		} catch {
 			// gone, or another user's
 		}

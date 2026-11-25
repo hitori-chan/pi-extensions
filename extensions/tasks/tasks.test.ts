@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { initTheme } from "@earendil-works/pi-coding-agent";
-import { clean, LineSplitter, Log, MESSAGE_TYPE, noticeText } from "./core.ts";
+import { getKeybindings } from "@earendil-works/pi-tui";
+import { clean, clip, ITEM_EVENT, ITEM_STOP_EVENT, LineSplitter, Log, MESSAGE_TYPE, noticeText, RUNNING_EVENT } from "./core.ts";
+import { lastText, type Stub, startStub } from "../../test/stub.ts";
 import tasksExtension from "./index.ts";
 
 // Task logs and pi's own bash temp files land here, not in the real tmpdir.
@@ -72,6 +74,27 @@ describe("core", () => {
 		assert.match(broken.error ?? "", /ENOENT|EACCES/);
 	});
 
+	it("Log.lines reads a bounded tail for scrolling; append keeps a transcript", () => {
+		const path = join(WORK, "scroll.log");
+		const log = new Log(path);
+		log.persist();
+		log.write(Buffer.from("first\nsecond\nthird\n"));
+		assert.deepEqual(log.lines(), { lines: ["first", "second", "third"], partial: false });
+		assert.deepEqual(log.lines(10), { lines: ["third"], partial: true }); // the cut line is dropped
+		log.close();
+		const more = new Log(path, { append: true });
+		more.persist();
+		more.write(Buffer.from("fourth\n"));
+		more.close();
+		assert.equal(readFileSync(path, "utf8"), "first\nsecond\nthird\nfourth\n");
+		assert.equal(more.size, 26);
+	});
+
+	it("clip keeps both ends of a long command", () => {
+		assert.equal(clip("npm run build && npm test", 100), "npm run build && npm test");
+		assert.equal(clip("aaaaabbbbbccccc", 7), "aaa…ccc");
+	});
+
 	it("clean strips escapes and keeps redrawn lines' last state", () => {
 		assert.equal(clean("\x1b]0;title\x07a\x1b[1;31mb\x1b[0m\r\nx\ry"), "ab\ny");
 	});
@@ -107,6 +130,21 @@ describe("core", () => {
 			noticeText({ kind: "event", id: "abc123", description: "d", lines: ["x", "y"], more: 2 }),
 			"[Monitor abc123: d]\nx\ny\n(2 more lines in the output file)",
 		);
+		assert.equal(
+			noticeText({ ...end, description: "d", tail: "", events: 2, lines: ["last"] }),
+			"[Monitor abc123: d — exited with code 1 after 1m 5s, 2 events]\nlast\nOutput: /tmp/x.log",
+		);
+		assert.equal(
+			noticeText({
+				...end,
+				description: "find the bug",
+				outcome: "completed",
+				ok: true,
+				tail: "",
+				agent: { report: "It is in parse().", turns: 3, input: 12_300, output: 450 },
+			}),
+			"[Agent abc123: find the bug — completed after 1m 5s, 3 turns, ↑12k ↓450 tokens]\nIt is in parse().\n\nTranscript: /tmp/x.log",
+		);
 	});
 });
 
@@ -118,6 +156,7 @@ function harness(mode = "tui") {
 	const commands = new Map<string, any>();
 	const sent: { message: any; options: any }[] = [];
 	const broadcasts: any[][] = [];
+	const channels = new Map<string, ((data: any) => void)[]>();
 	const notes: string[] = [];
 	let status: string | undefined;
 	let working: string | undefined;
@@ -130,7 +169,17 @@ function harness(mode = "tui") {
 		registerMessageRenderer: () => {},
 		sendMessage: (message: any, options: any) => void sent.push({ message, options }),
 		getSettings: () => ({}),
-		events: { emit: (_c: string, tasks: any[]) => void broadcasts.push(tasks), on: () => () => {} },
+		getThinkingLevel: () => "off",
+		events: {
+			emit: (channel: string, data: any) => {
+				if (channel === RUNNING_EVENT) broadcasts.push(data);
+				for (const h of channels.get(channel) ?? []) h(data);
+			},
+			on: (channel: string, h: (data: any) => void) => {
+				channels.set(channel, [...(channels.get(channel) ?? []), h]);
+				return () => {};
+			},
+		},
 	};
 	const theme = {
 		fg: (_c: string, t: string) => t,
@@ -154,7 +203,7 @@ function harness(mode = "tui") {
 			notify: (t: string) => void notes.push(t),
 			custom: (factory: any) =>
 				new Promise<void>((resolve) => {
-					view = factory({ requestRender: () => {} }, theme, {}, () => resolve());
+					view = factory({ requestRender: () => {} }, theme, getKeybindings(), () => resolve());
 				}),
 		},
 	};
@@ -169,6 +218,8 @@ function harness(mode = "tui") {
 		tools.get(tool).execute(`c${++calls}`, params, signal, undefined, ctx);
 	const text = (r: any) => r.content[0].text as string;
 	return {
+		pi,
+		ctx,
 		tools,
 		sent,
 		broadcasts,
@@ -277,7 +328,7 @@ describe("tasks", () => {
 		await assert.rejects(h.bash({ command: "true", timeout: -1 }), /Invalid timeout/);
 	});
 
-	it("timeouts: 2 minutes by default, at most 10; the same variables as Claude Code change them", async () => {
+	it("timeouts: 2 minutes by default, at most 10; BASH_DEFAULT_TIMEOUT_MS and BASH_MAX_TIMEOUT_MS change them", async () => {
 		const saved = { ...process.env };
 		try {
 			process.env.BASH_DEFAULT_TIMEOUT_MS = "300";
@@ -328,10 +379,14 @@ describe("tasks", () => {
 		assert.match(h.text(r), new RegExp(`^Monitoring as task ${id} for up to 300s\\. Output: `));
 		const end = await waitFor(() => h.sent.find((s) => s.message.details.kind === "end"));
 		const events = h.sent.filter((s) => s.message.details.kind === "event").map((s) => s.message.details.lines);
-		assert.deepEqual(events, [["one", "two"], ["three"], ["tail"]]);
+		// The last line arrives with the exit, in one notification.
+		assert.deepEqual(events, [["one", "two"], ["three"]]);
 		assert.equal(h.sent[0].message.content, `[Monitor ${id}: test lines]\none\ntwo`);
 		assert.deepEqual(h.sent[0].options, { deliverAs: "steer", triggerTurn: true });
-		assert.match(end.message.content, new RegExp(`^\\[Monitor ${id}: test lines — exited with code 0 after \\d+s, 3 events\\]`));
+		assert.match(
+			end.message.content,
+			new RegExp(`^\\[Monitor ${id}: test lines — exited with code 0 after \\d+s, 3 events\\]\\ntail\\nOutput: `),
+		);
 		assert.equal(readFileSync(end.message.details.file, "utf8"), "one\ntwo\nthree\noops\ntail");
 	});
 
@@ -369,6 +424,54 @@ describe("tasks", () => {
 		await closed;
 	});
 
+	it("/tasks shows other extensions' items and scrolls long output", async () => {
+		const stops: any[] = [];
+		h.pi.events.on(ITEM_STOP_EVENT, (data: any) => void stops.push(data));
+		h.pi.events.emit(ITEM_EVENT, {
+			key: "goal",
+			icon: "◎",
+			label: "npm test passes",
+			state: "active",
+			startedAt: Date.now() - 65_000,
+			stoppable: true,
+		});
+		await h.bash({ command: "seq 1 200; sleep 30", run_in_background: true });
+		const closed = h.tasks();
+		const render = () => h.view().render(100).join("\n");
+		assert.match(render(), /› ◎ goal    active · 1m 5s  npm test passes/);
+		assert.match(render(), /x stop/);
+		h.view().handleInput("x");
+		assert.deepEqual(stops, [{ key: "goal" }]);
+		h.view().handleInput("\x1b[B"); // the task
+		await waitFor(() => /^ {2}200$/m.test(render()));
+		assert.match(render(), /following/);
+		h.view().handleInput("\x1b[5~"); // page up
+		assert.match(render(), /\d+–\d+ of 200 lines/);
+		assert.doesNotMatch(render(), /^ {2}200$/m);
+		h.view().handleInput("\x1b[F"); // end: follow again
+		assert.match(render(), /following/);
+		h.pi.events.emit(ITEM_EVENT, { key: "goal", remove: true });
+		assert.doesNotMatch(render(), /◎ goal/);
+		h.view().handleInput("x"); // stops the task, the only row left
+		await waitFor(() => /was stopped by the user/.test(render()));
+		h.view().handleInput("\x1b");
+		await closed;
+	});
+
+	it("/tasks survives its last row going away", async () => {
+		const goal = { key: "goal", icon: "◎", label: "g", state: "active", stoppable: true };
+		h.pi.events.emit(ITEM_EVENT, goal);
+		const closed = h.tasks();
+		h.pi.events.emit(ITEM_EVENT, { key: "goal", remove: true }); // x cleared it
+		h.view().handleInput("\x1b[B");
+		h.view().handleInput("x");
+		assert.match(h.view().render(80).join("\n"), /0 running · 0 ended/);
+		h.pi.events.emit(ITEM_EVENT, goal);
+		assert.match(h.view().render(80).join("\n"), /› ◎ goal/);
+		h.view().handleInput("\x1b");
+		await closed;
+	});
+
 	it("shutdown kills running tasks and foreground commands without reporting", async () => {
 		const file = join(WORK, "shell.pids");
 		await h.bash({ command: `echo $$ >> ${file}; sleep 30`, run_in_background: true });
@@ -394,6 +497,11 @@ describe("tasks", () => {
 	it("headless runs wait at the final settle, continue with each notice, and limit tasks", async () => {
 		h = harness("print");
 		await h.emit("session_start", {});
+		// A monitor's last line arrives with its exit.
+		await h.monitor({ command: "sleep 0.2; echo built", description: "build" });
+		const ended = await h.settle();
+		assert.match(ended.entries[0].content, /^\[Monitor \w{6}: build — exited with code 0 after \d+s, 1 event\]\nbuilt\nOutput: /);
+
 		const r = await h.bash({ command: "sleep 0.2; echo ok", run_in_background: true });
 		assert.equal(await h.settle({ continue: true }), undefined); // another extension continues
 		const result = await h.settle();
@@ -411,5 +519,114 @@ describe("tasks", () => {
 		const limited = await h.settle();
 		assert.match(limited.entries[0].content, /was stopped after reaching its background time limit \(0s\)/);
 		assert.equal(h.sent.length, 0);
+	});
+});
+
+describe("agent", () => {
+	let h: ReturnType<typeof harness>;
+	let stub: Stub;
+	const saved = { ...process.env };
+	before(async () => {
+		stub = await startStub(async (messages, body) => {
+			const last = messages.at(-1);
+			if (last?.role === "tool") return { text: `after tool: ${JSON.stringify(last.content).slice(0, 60)}` };
+			const prompt = lastText(messages);
+			const users = messages.filter((m: any) => m.role === "user").length;
+			const spawn = prompt.match(/SPAWN:(\S+)/);
+			if (spawn)
+				return {
+					tool: "bash",
+					args: { command: `sleep 305 & echo $! > ${spawn[1]}; wait`, run_in_background: true },
+				};
+			if (prompt.includes("SLOW")) await sleep(1500);
+			const tools = (body.tools ?? []).map((t: any) => t.function.name).join(",");
+			return { text: `report ${users} [${tools}]: ${prompt}` };
+		});
+		Object.assign(process.env, stub.env);
+		mkdirSync(join(stub.agentDir, "agents"));
+		writeFileSync(
+			join(stub.agentDir, "agents", "scout.md"),
+			"---\nname: scout\ndescription: Finds things fast\ntools: read\n---\nYou are SCOUT-PROMPT.\n",
+		);
+	});
+	after(async () => {
+		process.env = saved;
+		await stub.close();
+	});
+	beforeEach(async () => {
+		h = harness();
+		h.ctx.model = { provider: "stub", id: "echo" };
+		h.ctx.isProjectTrusted = () => false;
+		await h.emit("session_start", {});
+	});
+	afterEach(() => h.emit("session_shutdown", {}));
+	const agent = (params: any, signal?: AbortSignal, onUpdate?: (r: any) => void) =>
+		h.tools.get("agent").execute("a1", params, signal, onUpdate, h.ctx);
+
+	it("lists named agents; runs one in the foreground, with its usage, and resumes it", async () => {
+		assert.match(h.tools.get("agent").description, /Named agents \(agent\): scout — Finds things fast/);
+		const updates: any[] = [];
+		const r = await agent({ description: "say hi", prompt: "hello there" }, undefined, (u) => updates.push(u));
+		assert.match(h.text(r), /^report 1 \[read,bash,edit,write,monitor,task_stop\]: hello there\n\n\[Agent (\w{6}) completed after \d+s, 1 turn, ↑100 ↓10 tokens\. Transcript: /);
+		assert.equal(r.isError, false);
+		assert.equal(r.usage.input, 100);
+		assert.equal(r.details.turns, 1);
+		const id = r.details.id;
+		assert.match(readFileSync(r.details.file, "utf8"), /^hello there\n\n\nreport 1/);
+		assert.equal(h.sent.length, 0); // its result was the report
+		const closed = h.tasks(); // listed as ended, with its transcript
+		assert.match(h.view().render(120).join("\n"), new RegExp(`✓ ${id}  completed · \\d+s  agent: say hi[\\s\\S]*report 1`));
+		h.view().handleInput("\x1b");
+		await closed;
+
+		const again = await agent({ description: "follow up", prompt: "and again", resume: id });
+		assert.equal(again.details.id, id);
+		assert.match(h.text(again), /^report 2 \[.*\]: and again/); // it kept its context
+		assert.match(readFileSync(again.details.file, "utf8"), /hello there[\s\S]*── resumed ──\nand again/);
+
+		await assert.rejects(agent({ description: "x", prompt: "x", resume: "nope" }), new RegExp(`No agent "nope"\\. Agents this session: ${id}`));
+		await assert.rejects(agent({ description: "x", prompt: "x", agent: "ghost" }), /No agent named "ghost"\. Available: scout/);
+	});
+
+	it("named agents get their tools and prompt", async () => {
+		const r = await agent({ description: "scout it", prompt: "look", agent: "scout" });
+		assert.match(h.text(r), /^report 1 \[read\]: look/);
+		const system = stub.requests.at(-1).messages[0];
+		assert.match(JSON.stringify(system), /SCOUT-PROMPT/);
+	});
+
+	it("runs in the background and reports; a failed start reports why", async () => {
+		const r = await agent({ description: "bg work", prompt: "SLOW job", run_in_background: true });
+		const id = r.details.id;
+		assert.match(h.text(r), new RegExp(`^Agent ${id} is running in the background`));
+		assert.equal(h.status(), "1 background task");
+		assert.equal(h.broadcasts.at(-1)![0].label, "agent: bg work");
+		const { message, options } = await waitFor(() => h.sent[0], 15_000);
+		assert.match(message.content, new RegExp(`^\\[Agent ${id}: bg work — completed after \\d+s, 1 turn, ↑100 ↓10 tokens\\]\\nreport 1 \\[.*\\]: SLOW job\\n\\nTranscript: `));
+		assert.deepEqual(options, { deliverAs: "steer", triggerTurn: true });
+
+		const failed = await agent({ description: "bad model", prompt: "x", model: "nope/missing" });
+		assert.equal(failed.isError, true);
+		assert.match(failed.details.outcome, /^failed \(exit code 1\): Error: Model "nope\/missing" not found/);
+		assert.doesNotMatch(failed.details.outcome, /No project session found/);
+	});
+
+	it("Ctrl+B moves a running agent to the background", async () => {
+		const pending = agent({ description: "slow one", prompt: "SLOW" });
+		await sleep(300);
+		assert.deepEqual(h.key("\x02"), { consume: true });
+		const r = await pending;
+		assert.match(h.text(r), /^\[Moved to the background by the user as agent \w{6}\./);
+		const { message } = await waitFor(() => h.sent[0], 15_000);
+		assert.match(message.content, /— completed after/);
+	});
+
+	it("stopping an agent also stops what its own tasks started", async () => {
+		const file = join(WORK, "agent-child.pid");
+		const r = await agent({ description: "spawner", prompt: `SPAWN:${file}`, run_in_background: true });
+		const [pid] = await pids(file, 1);
+		assert.ok(alive(pid));
+		await h.stop(r.details.id);
+		await waitFor(() => !alive(pid));
 	});
 });
